@@ -1,3 +1,4 @@
+import re
 import asyncio
 import base64
 import collections
@@ -87,6 +88,26 @@ class RedisLoopLayer:
             for index in list(self._connections):
                 connection = self._connections.pop(index)
                 await connection.close(close_connection_pool=True)
+
+
+class RedisClusterLoopLayer:
+    def __init__(self, channel_layer):
+        self._lock = asyncio.Lock()
+        self.channel_layer = channel_layer
+        self._connections = {}
+
+    def get_connection(self, index):
+        if index not in self._connections:
+            host, port, password = self.channel_layer.get_connection_info(index)
+            self._connections[index] = aioredis.Redis(host=host, port=port, password=password, ssl=True, ssl_cert_reqs=None, db=0)
+
+        return self._connections[index]
+
+    async def flush(self):
+        async with self._lock:
+            for index in list(self._connections):
+                connection = self._connections.pop(index)
+                await connection.close()
 
 
 class RedisChannelLayer(BaseChannelLayer):
@@ -707,5 +728,36 @@ class RedisChannelLayer(BaseChannelLayer):
         except KeyError:
             _wrap_close(self, loop)
             layer = self._layers[loop] = RedisLoopLayer(self)
+
+        return layer.get_connection(index)
+
+
+class RedisClusterChannelLayer(RedisChannelLayer):
+    def get_connection_info(self, index):
+        config = self.hosts[index]
+        pattern = "^redis\:\/\/((\w*)\:(\w*)\@)?([\w\.-]*)\:(\d+)(\/(\d+))?$"
+        match = re.match(pattern, config["address"])
+        host = match.group(4)
+        port = int(match.group(5))
+        password = match.group(3)
+        return host, port, password
+    
+    def connection(self, index):
+        """
+        Returns the correct connection for the index given.
+        Lazily instantiates pools.
+        """
+        # Catch bad indexes
+        if not 0 <= index < self.ring_size:
+            raise ValueError(
+                f"There are only {self.ring_size} hosts - you asked for {index}!"
+            )
+
+        loop = asyncio.get_running_loop()
+        try:
+            layer = self._layers[loop]
+        except KeyError:
+            _wrap_close(self, loop)
+            layer = self._layers[loop] = RedisClusterLoopLayer(self)
 
         return layer.get_connection(index)
